@@ -1,0 +1,1394 @@
+---
+title: "Text_Analytics"
+author: "Ryan M. Allen"
+date: "March 17, 2020"
+output: pdf_document
+geometry: margin = .75 in
+---
+
+```{r setup, include=FALSE, echo=FALSE, warning=FALSE }
+knitr::opts_chunk$set(echo = TRUE, fig.align = "left", fig.width = 8)
+set.seed(011491)
+
+
+library(spotifyr)
+library(ROSE)
+library(tidyverse)
+library(tm)
+library(klaR)
+library(rlang)
+library(mlr)
+library(SentimentAnalysis)
+library(stringr)
+library(tidytext)
+library(textdata)
+library(wordcloud)
+library(reshape2)
+library(corrplot)
+library(ggpubr)
+library(data.table)
+library(caret)
+library(FNN)
+library(pROC)
+library(e1071)
+library(randomForest)
+library(reshape)
+library(ggrepel)
+library(imputeTS)
+library(patchwork)
+library(BBmisc)
+library(rpart)
+
+theme_set(theme_light())
+
+data("stop_words")
+Sys.setenv(SPOTIFY_CLIENT_ID = '2be581e2461243e5872806eb68af69dc')
+Sys.setenv(SPOTIFY_CLIENT_SECRET = '5e56c841298242dbba8735961b7755d3')
+
+data <- read.csv("C:/Users/Ryan Allen/Documents/Regis/Classes/Practicum_II/Data/Master's Project- Best Original Song.csv")
+data <- data[1:143,]
+```
+
+
+### Data Collection and Cleansing
+I collected songs that were nominated for the Best Orignal Song. I have a column for the name the song, the year, the Spotify URI (a unique song identifier), the lyrics, and whether or not the song won (1 for won, 0 for nominated but lost). I collected data through 1990. I then used the Spotify API to collect the songs features and then joined that back to the original dataset.
+```{r, include=FALSE, echo=FALSE, warning=FALSE}
+# Splitting the data set because Spotify API cannot handle more than 100 songs at a time
+two_sets1 <- data[1:90,]
+two_sets2 <- data[91:143,]
+audio1 <- get_track_audio_features(ids = two_sets1$URI, authorization = get_spotify_access_token())
+audio2 <- get_track_audio_features(ids = two_sets2$URI, authorization = get_spotify_access_token())
+
+# Unioning the two song sets together
+songs_features <- rbind(audio1, audio2)
+
+# Combining the features back with the original data that has year, lyrics, and the target variable
+songs_combined <- left_join(data, songs_features, by = c("URI" = "id"))
+
+
+
+# Renaming columns
+songs <- songs_combined %>% dplyr::select(year = YEAR, title = BEST.ORIGINAL.SONG, target = WON..yes.1.no.0., lyrics = Lyrics, danceability, energy, key, loudness, mode, speechiness, acousticness, instrumentalness, liveness, valence, tempo, duration_ms, time_signature)
+
+# Restructuring columns
+
+
+songs$target <- as.factor(songs$target)
+songs$lyrics <- as.character(songs$lyrics)
+songs$title <- as.character(songs$title)
+
+songs <- songs %>% drop_na()
+# Tidying the text
+
+original_text <- songs %>% dplyr::select(year, title, lyrics) %>% 
+    unnest_tokens(word, lyrics)
+
+tidy_lyrics <- original_text %>% 
+    anti_join(stop_words, by = "word")
+
+
+word_count <- tidy_lyrics %>% group_by(year) %>%  add_count(word, sort = TRUE) %>% unique() %>%    
+     arrange(desc(year))
+
+afinn <- get_sentiments("afinn")
+
+# Sentiments by song
+song_scores <- tidy_lyrics %>% 
+    inner_join(afinn, by = c("word" = "word")) %>% 
+    dplyr::select(title,value) %>% 
+    group_by(title) %>% 
+    summarise(song_wordsentiment = sum(value)) %>% arrange(desc(song_wordsentiment))
+# Sentiments by year
+year_scores <- tidy_lyrics %>% 
+    inner_join(afinn, by = c("word" = "word")) %>% 
+    dplyr::select(year, value) %>% 
+    group_by(year) %>% 
+    summarise(year_wordsentiment = sum(value)) %>% arrange(desc(year_wordsentiment))
+
+# joining our word sentiments back to the data
+songs <- left_join(songs, song_scores, by = c("title" = "title"))
+songs <- left_join(songs, year_scores, by = c("year" = "year"))
+
+
+# Sentimens by song using NRC
+nrc <- get_sentiments("nrc")
+sentiments <- tidy_lyrics %>% inner_join(nrc, by = c("word" = "word")) %>% 
+    add_count(title, name = "total_words") %>% 
+    dplyr::select(title, sentiment, total_words) %>% 
+    group_by(title) %>% 
+    add_count(sentiment) %>% 
+    unique() %>%
+    mutate(percent_sentiment = round((n/total_words),2)) %>% 
+    dplyr::select(-n) %>% 
+    spread( sentiment, percent_sentiment)
+sentiments <- na_replace(sentiments, 0)  
+
+songs <- left_join(songs, sentiments, by = c("title" = "title"))
+
+# Man or Muppet has a song_sentiment score of 0 but it came in as NA
+songs$song_wordsentiment <- na_replace(songs$song_wordsentiment, 0)
+```
+
+### Text Analytics
+I used two different sentiment libraries to one is the AFINN package from Finn Arup Nielsen and the other is the nrc package from Saif Mohammad and Peter Turney. The AFINN Package assigns a number -4 through 4 to a every word in its dictionary and then for the plots below, I have summed the sentiment scores to get a total sentiment score, the higher the number the more positive the song lyrics are. THe nrc package assigns a feeling/emotion to each word in its library, things like fear, surprise, joy, disgust, anticipation, anger, sadness and trust. I then took the total number of words in each category and divided it by the total number of words (minus stop words) to get a percent anger, or a percent joy.
+
+```{r, echo=FALSE, cache=TRUE, warning=FALSE}
+songs %>% dplyr::select(title, song_wordsentiment, target) %>% ggplot(aes(x = reorder(title, song_wordsentiment), y = song_wordsentiment, fill = target)) +
+    geom_bar(stat = "identity")+
+    coord_flip() + 
+  labs(title = "Sentiment Score and Oscar Winning", x = "Songs", y = "Sentiment Score") +
+    theme(axis.text.y = element_blank(),
+        axis.ticks.y = element_blank()) +
+    labs(fill = "Winner") +
+    scale_fill_manual(values=c("#999999", "#0000CC"), 
+                       name="Target",
+                       breaks=c(1, 0),
+                       labels=c("Won", "Lost"))
+```
+Overall it seems there are more number of songs that have positive sentiments, but there does not seem to be a correlation between winning and sentiments.
+
+
+```{r, echo= FALSE, cache=FALSE}
+songs %>% dplyr::select(year, year_wordsentiment) %>% 
+    unique() %>% 
+    ggplot(aes(x = year, y = year_wordsentiment, fill = year_wordsentiment))+
+    geom_bar(stat = "identity", col = "black")+
+    coord_flip() + 
+    labs(title = "Sentiment Score by Year", x = "Year", y = "Sentiment Score", fill = "Sentiment") +
+    scale_fill_distiller(palette = "Spectral", direction = 1) +
+    geom_label(x = 2003, y = -75, label = "2005: -83", fill= "white") +
+    geom_label(x = 2016, y = 250, label = "2014: 268", fill = "white")
+```
+There appears to be a more variability in sentiment scores as time moves on. More recent years have wider swings. And years prior to 2005 overall seem to be more positive.
+
+
+
+```{r, echo=FALSE, cache=FALSE}
+year_means <- tidy_lyrics %>% 
+    inner_join(afinn, by = c("word" = "word")) %>% 
+    dplyr::select(year,value) %>% 
+    group_by(year) %>% 
+    summarise(mean = mean(value))
+tidy_lyrics <- left_join(tidy_lyrics, year_means, by = "year")
+
+tidy_lyrics %>% 
+    inner_join(afinn, by = c("word" = "word")) %>% 
+    dplyr::select(year,value, mean) %>% 
+    mutate(Positive_Mean = mean > 0) %>% 
+    ggplot(aes(x = year, y = value, fill = Positive_Mean)) + geom_boxplot(aes(group = year)) + 
+    labs(title = "Distribution of Sentiment Value by Year", x = "Year", y = "Sentiment Score") +
+    scale_fill_manual(values=c("#FF0000", "#56B4E9"), 
+                       name="Positive or\nNegative",
+                       breaks=c("FALSE", "TRUE"),
+                       labels=c("Negative", "Positive"))
+```
+There were 7 years that have an overall average sentiment of negative (less than 0) and we see that 2000 had the lowest median sentiment score of any year.
+
+
+
+```{r, echo=FALSE, cache=FALSE, warning=FALSE}
+rankorder <- tidy_lyrics %>% inner_join(nrc, by = c("word" = "word")) %>% 
+    add_count(title, name = "total_words") %>% 
+    dplyr::select(title, sentiment, total_words, year) %>% 
+    group_by(year) %>% 
+    add_count(sentiment) %>% 
+    dplyr::select(-title, -total_words) %>% 
+    unique() %>% 
+    filter(sentiment != "positive" & sentiment != "negative") %>% 
+    arrange(desc(year, n))
+rankedSentiments <- rankorder[order(-rankorder$n, rankorder$year),]
+rankorder %>%  mutate(rank = rank(desc(n), ties.method = "min")) %>% 
+    filter(rank <= 5) %>% 
+    ggplot(aes(x = year, y = rank)) + 
+    geom_label(aes(fill = factor(sentiment), label = rank), color = "white", fontface = "bold") +
+    labs(title = "The Top 5 Ranked Sentiments by Year", x = "", fill = "Seniment") + 
+    scale_x_continuous(limits = c(1988.9, 2019.1), breaks = c(1989:2019))+
+    scale_y_reverse() +
+    theme(panel.grid.minor = element_blank(), axis.text.x = element_text(angle = 90)) 
+
+```
+We see that Joy was the prevailing sentiment for much of the 90's and then it becomes less popular. There does not seem to be much of a trend in the top 5 sentiments each year.
+
+
+```{r, echo=FALSE, cache=FALSE, warning=FALSE, fig.align="left"}
+tidy_lyrics %>%
+  inner_join(get_sentiments("bing"), by = "word") %>%
+  count(word, sentiment, sort = TRUE) %>%
+  acast(word ~ sentiment, value.var = "n", fill = 0) %>%
+  comparison.cloud(colors = c("gray60", "deepskyblue3"),
+                   max.words = 100)
+```
+The most popular words split by their positivity. Love is not only the most used positive word, it is the most used word in our lyrics.
+
+#### Pairs Plots of Numeric Variables
+```{r, echo=FALSE, cache=FALSE, warning=FALSE, fig.height=6}
+
+numeric <- songs %>% dplyr::select(-lyrics, -title, -target)
+numeric1 <- numeric[,1:10]
+numeric2 <- numeric[,11:20]
+numeric3 <- numeric[,21:27]
+pairs(numeric1)
+pairs(numeric2)
+pairs(numeric3)
+
+```
+Variables relationships of note: I have a lot of repeat variables that might provide some collinearity, positive is very similar to joy, surprise, trust. Negative also has similar attributes. Energy and loudness are another pair that could prove problematic later on.
+
+
+```{r, echo=FALSE, cache=FALSE, warning=FALSE, message=FALSE}
+histograms <- songs %>%  
+  keep(is.numeric) %>% 
+  gather() %>% 
+  ggplot(aes(value)) +
+    facet_wrap(~ key, scales = "free") +
+    geom_histogram() +
+    labs(title = "Histograms of Numeric Variables")
+
+acousticness <- songs %>% dplyr::select(acousticness, target) %>% 
+    ggplot(aes(x = acousticness, fill = target)) +
+    geom_histogram(alpha = .4) + theme(legend.position = "none")+
+    labs(title = "Acousticness by Target") +
+    scale_fill_manual(values=c("#999999", "#0000CC"))
+duration <- songs %>% dplyr::select(duration_ms, target) %>% 
+    ggplot(aes(x = duration_ms, fill = target)) +
+    geom_histogram(alpha = .4) + theme(legend.position = "none") +
+    labs(title = "Duration by Target") +
+    scale_fill_manual(values=c("#999999", "#0000CC"))
+valence <- songs %>% dplyr::select(valence, target) %>% 
+    ggplot(aes(x = valence, fill = target)) +
+    geom_histogram(alpha = .4)+
+    labs(title = "Valence by Target") +
+    scale_fill_manual(values=c("#999999", "#0000CC"), 
+                       name="Target",
+                       breaks=c(1, 0),
+                       labels=c("Won", "Lost"))
+histograms
+acousticness + duration + valence
+```
+Acousticness has an inverse bell curve, I see a handful of skewed measures; total words, speechiness, disgust, surprise maybe, anger. I only see one that has any left skew which is loudness.
+
+I picked a couple of variables to see if there was a difference in target variable (winning) for any of them. It looks like for duration, valence, and acousticness that there is not much a difference distribution-wise between target variables.
+
+
+#### Boxplots by Target Variable
+```{r, echo=FALSE, cache=FALSE, warning=FALSE}
+# Removing variables that do not make sense and ones that are too big, starting with time signature
+songs_long <- songs %>% dplyr::select(-title, -lyrics, -year, -mode, - time_signature, -tempo, -song_wordsentiment, -year_wordsentiment, -total_words, -duration_ms, -loudness, -key) %>%
+    melt(id.vars = c("target"))
+songs_long$value <- scale(songs_long$value)
+
+songs_long %>% ggplot(aes(x = factor(variable), y = value, fill = factor(target))) +
+    geom_boxplot(alpha = .5) + theme(axis.text.x = element_text(angle = 90))+
+    labs(title = "Distributions by Target Variable", subtitle = "Small number variables", x = "Measure", y = "") +
+    scale_fill_manual(values=c("#999999", "#0000CC"), 
+                       name="Target",
+                       breaks=c(1, 0),
+                       labels=c("Won", "Lost"))
+
+songs_long2 <- songs %>% dplyr::select(time_signature, tempo, song_wordsentiment, year_wordsentiment, total_words, duration_ms, loudness, key, target) %>%
+    mutate(duration_min = duration_ms/60000) %>% 
+    dplyr::select(-duration_ms) %>% 
+    melt(id.vars = c("target"))
+songs_long2$value <- scale(songs_long2$value)
+songs_long2 %>% ggplot(aes(x = factor(variable), y = value, fill = factor(target))) +
+    geom_boxplot(alpha = .5) + theme(axis.text.x = element_text(angle = 90)) +
+    labs(title = "Distributions by Target Variable", subtitle = "Large number variables", fill = "Winning",
+         x = "Measure", y = "") + 
+    scale_fill_manual(values=c("#999999", "#0000CC"), 
+                       name="Target",
+                       breaks=c(1, 0),
+                       labels=c("Won", "Lost"))
+```
+Variables that appear to have a higher median for winning than losing: Danceability, Acousticness, Negative, Surprise, maybe Total Words.
+Variables that have a visually lower median for winning than losing: Valence, Disgust, Joy, Positive, Sadness, Trust and maybe Tempo.
+
+#### Corr plot
+``` {r, echo=FALSE, cache=FALSE}
+# imputing missing song sentiment for Man or Muppet 
+
+corrplot(cor(numeric), method = "square")
+
+```
+A couple of key observations with correlations, acousticness and energy are very strongly negatively correlated. Most of the lyric sentiment fields are either closely correlated with another field (anger and fear or joy and song sentiment) this could prove problematic with models later on.
+
+
+## Training the Models
+### Support Vector Machine
+
+#### Principal Component Analysis
+```{r, echo=FALSE, cache=FALSE, warning=FALSE}
+numeric_songs <- songs %>% dplyr::select(-lyrics, -title, -year)
+pca1 <- prcomp(numeric_songs[,-1], scale. =  TRUE)
+# pca2 <- prcomp(imputed2, scale = TRUE)
+# pca3 <- prcomp(imputed3, scale = TRUE)
+
+
+# # Exploring the PCA Results
+# fviz_eig(pca1)
+# fviz_eig(pca2)
+# fviz_eig(pca3)
+# 
+# fviz_pca_ind(pca1,
+#              col.ind = "cos2", #color by quality of representation
+#              gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+#              repel = TRUE)
+
+std_dev1 <- pca1$sdev
+# std_dev2 <- pca1$sdev
+# std_dev3 <- pca3$sdev
+# Variance of each principal component
+var1 <- std_dev1^2
+# var2 <- std_dev2^2
+# var3 <- std_dev3^2
+
+prop1_varex <- var1/sum(var1)
+# prop2_varex <- var2/sum(var2)
+# prop3_varex <- var3/sum(var3)
+
+#scree plot
+screeplot(pca1, type = "l", npcs = 15, main = "Screeplot of the first 10 PCs")
+abline(h = 1, col = "red", lty = 5)
+legend("topright", legend=c("Eigenvalue = 1"),
+       col=c("red"), lty=5, cex=0.6)
+#cumulative scree plot
+cumpro <- cumsum(pca1$sdev^2 / sum(pca1$sdev^2))
+plot(cumpro[0:15], xlab = "PC #", ylab = "Amount of explained variance", main = "Cumulative variance plot")
+abline(v = 10, col="blue", lty=5)
+abline(h = 0.73, col="blue", lty=5)
+legend("topleft", legend=c("Cut-off @ PC10"),
+       col=c("blue"), lty=5, cex=0.6)
+
+library("factoextra")
+fviz_pca_ind(pca1, geom.ind = "point", pointshape = 21, 
+             pointsize = 2, 
+             fill.ind = numeric_songs$target, 
+             col.ind = "black", 
+             palette = "jco", 
+             addEllipses = TRUE,
+             label = "var",
+             col.var = "black",
+             repel = TRUE,
+             legend.title = "Winning") +
+  ggtitle("2D PCA-plot from 30 feature dataset") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+song_pca <- pca1$x[,1:10]
+song_pca <- cbind(song_pca, as.numeric(songs$target)-1)
+
+colnames(song_pca)[11] <- "target"
+```
+From our plot we see that there is not much separation between our winning and losing variable (1, 0) respectively.
+
+
+```{r, echo=FALSE, cache=FALSE, warning=FALSE}
+numeric_songs <- songs %>% dplyr::select(-lyrics, -title, -year)
+
+# Raw Data
+trN.index <- createDataPartition(numeric_songs$target, p = .75)$Resample1
+trainN_songs <- numeric_songs[trN.index,]
+testN_songs <- numeric_songs[-trN.index,]
+
+# Scaling Data without the target variable
+normal <- as.data.frame(numeric_songs %>% dplyr::select(-target))
+scaled <- normalize(normal)
+
+# Replacing target variable
+scaled$target <- numeric_songs$target
+
+# Creating train and test
+tr.index <- createDataPartition(scaled$target, p = .75)$Resample1
+trainScale_songs <- scaled[tr.index,]
+testScale_songs <- scaled[-tr.index,]
+
+
+# PCA
+songs_raw <- as.matrix(numeric_songs)
+
+smp_size_raw <- floor(.75 * nrow(songs_raw))
+train_ind_raw <- sample(nrow(songs_raw), size = smp_size_raw)
+train_raw.df <- as.data.frame(songs_raw[train_ind_raw, ])
+test_raw.df <- as.data.frame(songs_raw[-train_ind_raw, ])
+trainPCA_songs <- as.data.frame(song_pca[train_ind_raw, ])
+testPCA_songs <- as.data.frame(song_pca[-train_ind_raw, ])
+trainPCA_songs$target <- as.factor(trainPCA_songs$target)
+# over sampling to handle class imbalance
+over_NTrain <- ovun.sample(target ~ ., data = trainN_songs, method = "over", N = 160)$data
+
+# Undersampling
+under_NTrain <- ovun.sample(target ~ ., data = trainN_songs, method = "under", N = 50, seed = 1)$data
+
+# Both
+both_NTrain <- ovun.sample(target ~ ., data = trainN_songs, method = "both", p =.5, N= 105, seed = 1)$data
+
+# ROSE
+rose_NTrain <- ovun.sample(target ~ ., data = trainN_songs, seed = 1)$data
+
+# over sampling to handle class imbalance
+over_PCATrain <- ovun.sample(target ~ ., data = trainPCA_songs, method = "over", N = 160)$data
+
+# Undersampling
+under_PCATrain <- ovun.sample(target ~ ., data = trainPCA_songs, method = "under", N = 50, seed = 1)$data
+
+# Both
+both_PCATrain <- ovun.sample(target ~ ., data = trainPCA_songs, method = "both", p =.5, N= 105, seed = 1)$data
+
+# ROSE
+rose_PCATrain <- ovun.sample(target ~ ., data = trainPCA_songs, seed = 1)$data
+
+# over sampling to handle class imbalance
+over_ScaleTrain <- ovun.sample(target ~ ., data = trainScale_songs, method = "over", N = 160)$data
+
+# Undersampling
+under_ScaleTrain <- ovun.sample(target ~ ., data = trainScale_songs, method = "under", N = 50, seed = 1)$data
+
+# Both
+both_ScaleTrain <- ovun.sample(target ~ ., data = trainScale_songs, method = "both", p =.5, N= 105, seed = 1)$data
+
+# ROSE
+rose_ScaleTrain <- ovun.sample(target ~ ., data = trainScale_songs, seed = 1)$data
+## Train data
+# # trainN_songs
+# over_NTrain
+# under_NTrain
+# both_NTrain
+# rose_NTrain
+# # trainPCA_songs
+# over_PCATrain
+# under_PCATrain
+# both_PCATrain
+# rose_PCATrain
+# # trainScale_songs
+# over_ScaleTrain
+# under_ScaleTrain
+# both_ScaleTrain
+# rose_ScaleTrain
+# 
+# # Test data
+# testN_songs
+# testPCA_songs
+# testScale_songs
+```
+
+
+# Models
+### SVM and Regression Trees
+These models were attempted on three different datasets: raw, scaled, and the principal component analysis data. I also use each of the datasets as is and then perform some sampling methods to handle target imbalance. I use over sampling of the minority samples, under sampling of the majority samples, or both. The rose variation sets the probability of the minority sample. 
+```{r, cache=TRUE, echo=FALSE, warning=FALSE, message=FALSE}
+# SVM Raw data
+best_svm <- tune(svm,
+                  target ~ .,
+                  data = trainN_songs,
+                  ranges = list(gamma = c(0.0001,0.001, 0.01, 0.1), cost = c(0.1, 1, 5, 10)),
+                  tunecontrol = tune.control(sampling = "cross", cross = 3), kernel = "radial")
+# summary(best_svm)
+# over sampling to handle class imbalance
+balanced_over <- ovun.sample(target ~ ., data = trainN_songs, method = "over", N = 160)$data
+
+# Undersampling
+balanced_under <- ovun.sample(target ~ ., data = trainN_songs, method = "under", N = 50, seed = 1)$data
+
+# Both
+balanced_both <- ovun.sample(target ~ ., data = trainN_songs, method = "both", p =.5, N= 105, seed = 1)$data
+
+# # ROSE
+balanced_ROSE <- ovun.sample(target ~ ., data = trainN_songs, seed = 1)$data
+# svm_reg <- svm(target ~ .,
+#                  data = trainN_songs,
+#                  kernel = "radial",
+#                  gamma = 0.001,
+#                  cost = .1,
+#                  probability = T)
+# svm_over <- svm(target ~ .,
+#                  data = balanced_over,
+#                  kernel = "radial",
+#                  gamma = 0.001,
+#                  cost = .1,
+#                  probability = T)
+# 
+# svm_under <- svm(target ~ .,
+#                  data = balanced_under,
+#                  kernel = "radial",
+#                  gamma = 0.001,
+#                  cost = .1,
+#                  probability = T)
+# svm_both <- svm(target ~ .,
+#                  data = balanced_both,
+#                  kernel = "radial",
+#                  gamma = 0.001,
+#                  cost = .1,
+#                  probability = T)
+# 
+# svm_rose <- svm(target ~ .,
+#                  data = balanced_ROSE,
+#                  kernel = "radial",
+#                  gamma = 0.001,
+#                  cost = .1,
+#                  probability = T)
+# 
+# # Predictions with raw data
+# pred_svm_reg <- predict(svm_reg, newdata = testN_songs[,-1])
+# pred_svm_rose <- predict(svm_rose, newdata = testN_songs[,-1])
+# pred_svm_over <- predict(svm_over, newdata = testN_songs[,-1])
+# pred_svm_under <- predict(svm_under, newdata = testN_songs[,-1])
+# pred_svm_both <- predict(svm_both, newdata = testN_songs[,-1])
+# 
+# svm_reg_raw <- roc.curve(as.vector(testN_songs$target), as.vector(pred_svm_reg))
+# svm_rose_raw <- roc.curve(as.vector(testN_songs$target), as.vector(pred_svm_rose)) # .596
+# svm_over_raw <- roc.curve(as.vector(testN_songs$target), as.vector(pred_svm_over)) # .5
+# svm_under_raw <- roc.curve(as.vector(testN_songs$target), as.vector(pred_svm_under)) # .649, .63
+# svm_both_raw <- roc.curve(as.vector(testN_songs$target), as.vector(pred_svm_both)) #.596
+# 
+# svm_reg_raw # .5
+# svm_rose_raw # .596
+# svm_over_raw # .5
+# svm_under_raw # .5
+# svm_both_raw # .5
+
+tree.reg <- rpart(target ~ ., data = trainN_songs)
+tree.rose <- rpart(target ~ ., data = balanced_ROSE)
+tree.over <- rpart(target ~ ., data = balanced_over)
+tree.under <- rpart(target ~ ., data = balanced_under)
+tree.both <- rpart(target ~ ., data = balanced_both)
+
+pred.tree.reg  <- predict(tree.reg, newdata = testN_songs[,-1])
+pred.tree.rose <- predict(tree.rose, newdata = testN_songs[,-1])
+pred.tree.over <- predict(tree.over, newdata = testN_songs[,-1])
+pred.tree.under <- predict(tree.under, newdata = testN_songs[,-1])
+pred.tree.both <- predict(tree.both, newdata = testN_songs[,-1])
+
+tree_reg_raw <- roc.curve(testN_songs$target, pred.tree.reg[,2])
+tree_rose_raw <- roc.curve(testN_songs$target, pred.tree.rose[,2])
+tree_over_raw <- roc.curve(testN_songs$target, pred.tree.over[,2])
+tree_under_raw <- roc.curve(testN_songs$target, pred.tree.under[,2])
+tree_both_raw <- roc.curve(testN_songs$target, pred.tree.both[,2])
+
+# tree_reg_raw # .531
+tree_rose_raw # .644
+tree_over_raw # .7
+tree_under_raw # .538
+tree_both_raw # .644
+
+tree_over_raw_results <- ifelse(pred.tree.over[,2] > 0.5, 1, 0)
+
+confusionMatrix(as.factor(tree_over_raw_results), as.factor(testN_songs$target))
+# Scale SVM
+best_svm <- tune(svm,
+                  target ~ .,
+                  data = trainScale_songs,
+                  ranges = list(gamma = c(0.0001,0.001, 0.01, 0.1), cost = c(0.1, 1, 5, 10)),
+                  tunecontrol = tune.control(sampling = "cross", cross = 3), kernel =  "radial")
+# summary(best_svm)
+# over sampling to handle class imbalance
+balanced_over <- ovun.sample(target ~ ., data = trainScale_songs, method = "over", N = 160)$data
+
+# Undersampling
+balanced_under <- ovun.sample(target ~ ., data = trainScale_songs, method = "under", N = 50, seed = 1)$data
+
+# Both
+balanced_both <- ovun.sample(target ~ ., data = trainScale_songs, method = "both", p =.5, N= 105, seed = 1)$data
+
+# ROSE
+balanced_ROSE <- ovun.sample(target ~ ., data = trainScale_songs, seed = 1)$data
+svm_reg <- svm(target ~ .,
+                 data = trainScale_songs,
+                 kernel = "radial",
+                 gamma = 0.1,
+                 cost = 5,
+                 probability = T)
+svm_over <- svm(target ~ .,
+                 data = balanced_over,
+                 kernel = "radial",
+                 gamma = 0.1,
+                 cost = 5,
+                 probability = T)
+
+svm_under <- svm(target ~ .,
+                 data = balanced_under,
+                 kernel = "radial",
+                 gamma = 0.1,
+                 cost = 5,
+                 probability = T)
+svm_both <- svm(target ~ .,
+                 data = balanced_both,
+                 kernel = "radial",
+                 gamma = 0.1,
+                 cost = 5,
+                 probability = T)
+
+svm_rose <- svm(target ~ .,
+                 data = balanced_ROSE,
+                 kernel = "radial",
+                 gamma = 0.1,
+                 cost = 5,
+                 probability = T)
+
+# Predictions with scale data
+pred_svm_reg <- predict(svm_reg, newdata = testScale_songs[,-27])
+pred_svm_rose <- predict(svm_rose, newdata = testScale_songs[,-27])
+pred_svm_over <- predict(svm_over, newdata = testScale_songs[,-27])
+pred_svm_under <- predict(svm_under, newdata = testScale_songs[,-27])
+pred_svm_both <- predict(svm_both, newdata = testScale_songs[,-27])
+
+svm_reg_scale <- roc.curve(as.vector(testScale_songs$target), as.vector(pred_svm_reg))
+svm_rose_scale <- roc.curve(as.vector(testScale_songs$target), as.vector(pred_svm_rose)) # .596
+svm_over_scale <- roc.curve(as.vector(testScale_songs$target), as.vector(pred_svm_over)) # .5
+svm_under_scale <- roc.curve(as.vector(testScale_songs$target), as.vector(pred_svm_under)) # .649, .63
+svm_both_scale <- roc.curve(as.vector(testScale_songs$target), as.vector(pred_svm_both)) #.596
+
+svm_reg_scale # .519
+svm_rose_scale # .596
+svm_over_scale # .5
+svm_under_scale # .649
+svm_both_scale # .596
+
+tree.reg <- rpart(target ~ ., data = testScale_songs)
+tree.rose <- rpart(target ~ ., data = balanced_ROSE)
+tree.over <- rpart(target ~ ., data = balanced_over)
+tree.under <- rpart(target ~ ., data = balanced_under)
+tree.both <- rpart(target ~ ., data = balanced_both)
+
+pred.tree.reg <- predict(tree.reg, newdata = testScale_songs[,-27])
+pred.tree.rose <- predict(tree.rose, newdata = testScale_songs[,-27])
+pred.tree.over <- predict(tree.over, newdata = testScale_songs[,-27])
+pred.tree.under <- predict(tree.under, newdata = testScale_songs[,-27])
+pred.tree.both <- predict(tree.both, newdata = testScale_songs[,-27])
+
+
+tree_reg_scale <- roc.curve(testScale_songs$target, pred.tree.reg[,2])
+tree_rose_scale <- roc.curve(testScale_songs$target, pred.tree.rose[,2])
+tree_over_scale <- roc.curve(testScale_songs$target, pred.tree.over[,2])
+tree_under_scale <- roc.curve(testScale_songs$target, pred.tree.under[,2])
+tree_both_scale <- roc.curve(testScale_songs$target, pred.tree.both[,2])
+
+tree_reg_scale # .5
+tree_rose_scale # .644
+tree_over_scale # .567
+tree_under_scale # .538
+tree_both_scale # .644
+
+# PCA SVM
+best_svm <- tune(svm,
+                  target ~ .,
+                  data = trainPCA_songs,
+                  ranges = list(gamma = c(0.0001,0.001, 0.01, 0.1), cost = c(0.1, 1, 5, 10)),
+                  tunecontrol = tune.control(sampling = "cross", cross = 3), type = "C-classification")
+# summary(best_svm)
+# over sampling to handle class imbalance
+balanced_over <- ovun.sample(target ~ ., data = trainPCA_songs, method = "over", N = 160)$data
+
+# Undersampling
+balanced_under <- ovun.sample(target ~ ., data = trainPCA_songs, method = "under", N = 50, seed = 1)$data
+
+# Both
+balanced_both <- ovun.sample(target ~ ., data = trainPCA_songs, method = "both", p =.5, N= 105, seed = 1)$data
+
+# ROSE
+balanced_ROSE <- ovun.sample(target ~ ., data = trainPCA_songs, seed = 1)$data
+svm_reg <- svm(target ~ .,
+                 data = trainPCA_songs,
+                 kernel = "radial",
+                 gamma = 0.0001,
+                 cost = .1,
+                 probability = T)
+svm_over <- svm(target ~ .,
+                 data = balanced_over,
+                 kernel = "radial",
+                 gamma = 0.0001,
+                 cost = .1,
+                 probability = T)
+
+svm_under <- svm(target ~ .,
+                 data = balanced_under,
+                 kernel = "radial",
+                 gamma = 0.0001,
+                 cost = .1,
+                 probability = T)
+svm_both <- svm(target ~ .,
+                 data = balanced_both,
+                 kernel = "radial",
+                 gamma = 0.0001,
+                 cost = .1,
+                 probability = T)
+
+svm_rose <- svm(target ~ .,
+                 data = balanced_ROSE,
+                 kernel = "radial",
+                 gamma = 0.0001,
+                 cost = .1,
+                 probability = T)
+
+# Predictions with PCA
+
+
+pred_svm_reg <- predict(svm_reg, newdata = testPCA_songs[,-11])
+pred_svm_rose <- predict(svm_rose, newdata = testPCA_songs[,-11])
+pred_svm_over <- predict(svm_over, newdata = testPCA_songs[,-11])
+pred_svm_under <- predict(svm_under, newdata = testPCA_songs[,-11])
+pred_svm_both <- predict(svm_both, newdata = testPCA_songs[,-11])
+
+svm_reg_pca <- roc.curve(as.vector(testPCA_songs$target), as.vector(pred_svm_reg))
+svm_rose_pca <- roc.curve(as.vector(testPCA_songs$target), as.vector(pred_svm_rose))
+svm_over_pca <- roc.curve(as.vector(testPCA_songs$target), as.vector(pred_svm_over))
+svm_under_pca <- roc.curve(as.vector(testPCA_songs$target), as.vector(pred_svm_under))
+svm_both_pca <- roc.curve(as.vector(testPCA_songs$target), as.vector(pred_svm_both))
+
+tree.reg <- rpart(target ~ ., data = trainPCA_songs)
+tree.rose <- rpart(target ~ ., data = balanced_ROSE)
+tree.over <- rpart(target ~ ., data = balanced_over)
+tree.under <- rpart(target ~ ., data = balanced_under)
+tree.both <- rpart(target ~ ., data = balanced_both)
+
+pred.tree.reg <- predict(tree.reg, newdata = testPCA_songs[,-11])
+pred.tree.rose <- predict(tree.rose, newdata = testPCA_songs[,-11])
+pred.tree.over <- predict(tree.over, newdata = testPCA_songs[,-11])
+pred.tree.under <- predict(tree.under, newdata = testPCA_songs[,-11])
+pred.tree.both <- predict(tree.both, newdata = testPCA_songs[,-11])
+
+tree_reg_pca <- roc.curve(testPCA_songs$target, pred.tree.rose[,2])
+tree_rose_pca <- roc.curve(testPCA_songs$target, pred.tree.rose[,2])
+tree_over_pca <- roc.curve(testPCA_songs$target, pred.tree.over[,2])
+tree_under_pca <- roc.curve(testPCA_songs$target, pred.tree.under[,2])
+tree_both_pca <- roc.curve(testPCA_songs$target, pred.tree.both[,2])
+
+tree_reg_pca # .736
+tree_rose_pca # .736
+tree_over_pca # .638
+tree_under_pca # .615
+tree_both_pca # .713
+
+tree_both_pca_results <- ifelse(pred.tree.both[,2] > 0.5,1,0)
+confusionMatrix(as.factor(tree_both_pca_results), as.factor(testPCA_songs$target))
+
+```
+The best models so far are the regression trees using the regular data with the pca dataset. It also tied with the rose pca followed by the regression tree with both sampling. 
+I need to test their confusion matrices next.
+
+### Logistic Regressions
+```{r, echo=FALSE, cache=FALSE, warning=FALSE}
+# Logistic Regression without PCA
+model <- glm(target ~ ., data = trainScale_songs, family=binomial(link='logit'))
+summary(model)
+anova(model, test = 'Chisq')
+
+fitted.results <- predict(model,newdata=testScale_songs[,-27],type='response')
+fitted.results <- ifelse(fitted.results > 0.5,1,0)
+
+misClasificError <- mean(fitted.results != testScale_songs$target)
+print(paste('Accuracy',1-misClasificError))
+confusionMatrix(as.factor(fitted.results), as.factor(testScale_songs$target))
+
+# Over_ Model
+over_model <- glm(target ~ ., data = over_ScaleTrain, family=binomial(link='logit'))
+# summary(over_model)
+over_model <- glm(target ~ disgust + total_words + speechiness + key + danceability,data = over_ScaleTrain, family = binomial(link = 'logit'))
+over_results <- predict(over_model,newdata=testScale_songs[,-27],type='response')
+over_results <- ifelse(over_results > 0.5,1,0)
+
+over_misClasificError <- mean(over_results != testScale_songs$target)
+print(paste('Accuracy',1 - over_misClasificError))
+confusionMatrix(as.factor(over_results), as.factor(testScale_songs$target))
+
+# Both_ Model
+both_model <- glm(target ~ ., data = both_ScaleTrain, family=binomial(link='logit'))
+summary(both_model)
+both_model <- glm(target ~ tempo + key, data = both_ScaleTrain, family = binomial(link = 'logit'))
+both_results <- predict(both_model,newdata=testScale_songs[,-27],type='response')
+both_results <- ifelse(both_results > 0.5,1,0)
+
+both_misClasificError <- mean(both_results != testScale_songs$target)
+print(paste('Accuracy',1 - both_misClasificError))
+confusionMatrix(as.factor(both_results), as.factor(testScale_songs$target))
+
+# Rose_ Model
+rose_model <- glm(target ~ ., data = rose_ScaleTrain, family=binomial(link='logit'))
+summary(rose_model)
+rose_model <- glm(target ~ tempo + key, data = both_ScaleTrain, family = binomial(link = 'logit'))
+rose_results <- predict(rose_model,newdata=testScale_songs[,-27],type='response')
+rose_results <- ifelse(rose_results > 0.5,1,0)
+
+rose_misClasificError <- mean(rose_results != testScale_songs$target)
+print(paste('Accuracy',1 - rose_misClasificError))
+confusionMatrix(as.factor(rose_results), as.factor(testScale_songs$target))
+
+
+## With PCA
+songs_raw <- as.matrix(numeric_songs)
+
+smp_size_raw <- floor(.75 * nrow(songs_raw))
+train_ind_raw <- sample(nrow(songs_raw), size = smp_size_raw)
+train_raw.df <- as.data.frame(songs_raw[train_ind_raw, ])
+test_raw.df <- as.data.frame(songs_raw[-train_ind_raw, ])
+trainPCA_songs <- as.data.frame(song_pca[train_ind_raw, ])
+testPCA_songs <- as.data.frame(song_pca[-train_ind_raw, ])
+trainPCA_songs$target <- as.factor(trainPCA_songs$target)
+model <- glm(target ~ ., data = trainPCA_songs, family=binomial(link='logit'))
+summary(model)
+anova(model, test = 'Chisq')
+
+fitted.results <- predict(model,newdata=testPCA_songs[,-11], type = 'response')
+fitted.results <- ifelse(fitted.results > 0.3,1,0)
+
+glm.roc <- roc(testPCA_songs$target, fitted.results)
+
+# Area Under the curve, we want this as close to 1 as we can get
+print(glm.roc$auc)
+
+# ROC Curve
+plot(glm.roc)
+
+
+misClasificError <- mean(fitted.results != testPCA_songs$target)
+print(paste('Accuracy',1-misClasificError))
+confusionMatrix(as.factor(fitted.results), as.factor(testPCA_songs$target))
+
+# Over_ PCA
+over_model <- glm(target ~ ., data = over_PCATrain, family=binomial(link='logit'))
+summary(over_model)
+over_model <- glm(target ~ PC4 + PC5, data = over_PCATrain, family = binomial(link = 'logit'))
+
+over_pcaresults <- predict(over_model, newdata=testPCA_songs[,-11], type = 'response')
+over_pcaresults <- ifelse(over_pcaresults < 0.3,1,0)
+
+glm.roc <- roc(testPCA_songs$target, over_pcaresults)
+
+# Area Under the curve, we want this as close to 1 as we can get
+print(glm.roc$auc)
+
+# ROC Curve
+plot(glm.roc)
+
+
+misClasificError <- mean(over_pcaresults != testPCA_songs$target)
+print(paste('Accuracy',1-misClasificError))
+confusionMatrix(as.factor(over_pcaresults), as.factor(testPCA_songs$target))
+
+
+# Under_ PCA
+under_model <- glm(target ~ ., data = under_PCATrain, family=binomial(link='logit'))
+summary(under_model)
+# under_model <- glm(target ~ PC4 + PC5, data = under_PCATrain, family = binomial(link = 'logit'))
+
+under_pcaresults <- predict(under_model, newdata=testPCA_songs[,-11], type = 'response')
+under_pcaresults <- ifelse(under_pcaresults < 0.3,1,0)
+
+glm.roc <- roc(testPCA_songs$target, under_pcaresults)
+
+# Area Under the curve, we want this as close to 1 as we can get
+print(glm.roc$auc)
+
+# ROC Curve
+plot(glm.roc)
+
+
+misClasificError <- mean(under_pcaresults != testPCA_songs$target)
+print(paste('Accuracy',1-misClasificError))
+confusionMatrix(as.factor(under_pcaresults), as.factor(testPCA_songs$target))
+
+# Both_ PCA
+both_model <- glm(target ~ ., data = both_PCATrain, family=binomial(link='logit'))
+summary(both_model)
+both_model <- glm(target ~ PC3 + PC2, data = both_PCATrain, family = binomial(link = 'logit'))
+
+both_pcaresults <- predict(both_model, newdata=testPCA_songs[,-11], type = 'response')
+both_pcaresults <- ifelse(both_pcaresults < 0.3,1,0)
+
+glm.roc <- roc(testPCA_songs$target, both_pcaresults)
+
+# Area Under the curve, we want this as close to 1 as we can get
+print(glm.roc$auc)
+
+# ROC Curve
+plot(glm.roc)
+
+
+misClasificError <- mean(both_pcaresults != testPCA_songs$target)
+print(paste('Accuracy',1-misClasificError))
+confusionMatrix(as.factor(both_pcaresults), as.factor(testPCA_songs$target))
+
+# Rose_ PCA
+rose_model <- glm(target ~ ., data = rose_PCATrain, family=binomial(link='logit'))
+summary(rose_model)
+rose_model <- glm(target ~ PC3 + PC2 + PC7, data = rose_PCATrain, family = binomial(link = 'logit'))
+
+rose_pcaresults <- predict(rose_model, newdata=testPCA_songs[,-11], type = 'response')
+rose_pcaresults <- ifelse(rose_pcaresults < 0.3,1,0)
+
+glm.roc <- roc(testPCA_songs$target, rose_pcaresults)
+
+# Area Under the curve, we want this as close to 1 as we can get
+print(glm.roc$auc)
+
+# ROC Curve
+plot(glm.roc)
+
+
+misClasificError <- mean(rose_pcaresults != testPCA_songs$target)
+print(paste('Accuracy',1-misClasificError))
+confusionMatrix(as.factor(rose_pcaresults), as.factor(testPCA_songs$target))
+
+```
+The best model in here is the Rose_PCA model which uses the Rose package and the PCA dataset. It has an accuracy of 71% (sensitivity of .82 and specificity of .29). This is not much better than just saying that all the songs lose. Because there are 4-5 songs nominated each year, you would be correct with around 75-80%
+
+```{r, echo=FALSE, cache=FALSE, warning=FALSE}
+# Naive Bayes approach
+naive_model <- naiveBayes(target ~ ., data = trainN_songs)
+
+# naive_model
+nb_predict <- predict(naive_model, testN_songs)
+
+
+confusionMatrix(as.factor(nb_predict), as.factor(testN_songs$target))
+
+## mlr 
+## iniitalize the classifier
+task <-  makeClassifTask(data = trainN_songs, target = "target")
+
+## train the model
+selected_model <- makeLearner("classif.naiveBayes")
+
+nb_mlr <- mlr::train(selected_model, task)
+# nb_mlr$learner.model
+mlr_predict <- as.data.table(predict(nb_mlr, newdata = testN_songs[,-1]))
+
+confusionMatrix(as.factor(mlr_predict$response), as.factor(testN_songs$target))
+
+```
+The mlr learning on the Naive Bayes approach has the highest specificity (correctly predicting winning songs) even though the model had an accuracy of 68%.
+
+```{r, echo=FALSE, cache=FALSE, warning=FALSE}
+#LDA
+songs_raw <- as.matrix(numeric_songs)
+
+smp_size_raw <- floor(.75 * nrow(songs_raw))
+train_ind_raw <- sample(nrow(songs_raw), size = smp_size_raw)
+train_raw.df <- as.data.frame(songs_raw[train_ind_raw, ])
+test_raw.df <- as.data.frame(songs_raw[-train_ind_raw, ])
+
+# # f <- paste(names(train_raw.df)[1], "~", paste(names(train_raw.df)[-1], collapse=" + "))
+#songs_raw.lda <- lda(target ~ ., data = train_raw.df)
+# songs_raw.lda.predict <- predict(songs_raw.lda, newdata = test_raw.df)
+
+
+# LDA model
+trainPCA_songs <- as.data.frame(song_pca[train_ind_raw, ])
+testPCA_songs <- as.data.frame(song_pca[-train_ind_raw, ])
+#
+model_LDA <- lda(target ~ ., data = trainPCA_songs)
+
+lda_predict <- predict(model_LDA, newdata = testPCA_songs)
+#
+#
+fitted.results <- ifelse(lda_predict$x > 0.5,1,0)
+confusionMatrix(as.factor(fitted.results), as.factor(testPCA_songs$target))
+
+```
+
+
+```{r, include=FALSE, echo=FALSE, warning=FALSE, cache=TRUE}
+# Kmeans with Scaled
+
+km.scale <- kmeans(testScale_songs, 2, nstart = 20)
+
+km.pca <- kmeans(testPCA_songs, 2, nstart = 20)
+
+kmeansroc <- roc(testScale_songs$target, km.scale$cluster)
+kmeansroc
+plot(kmeansroc)
+confusionMatrix(as.factor(km.scale$cluster -1), as.factor(testScale_songs$target))
+
+kmeansrocpca <- roc(testPCA_songs$target, km.pca$cluster)
+kmeansrocpca
+plot(kmeansrocpca)
+confusionMatrix(as.factor(km.pca$cluster -1), as.factor(testPCA_songs$target))
+```
+
+
+### KNN
+#### PCA Datasets
+```{r, include=FALSE, echo=FALSE, warning=FALSE, cache=TRUE}
+# KNN
+# train/test splits
+
+# Regular PCA dataset (accuracy 71% and specificity 0%)
+pca_tr.feats <- trainPCA_songs[,-11]
+pca_tr.targs <- trainPCA_songs[,11]
+
+pca_te.feats <- testPCA_songs[,-11]
+pca_te.targs <- testPCA_songs[,11]
+
+# We loop from 2 to 30 to try to find the best number of neighbors for KNN.  Seems around 19 is best.
+
+# find best number of k neighbors
+neighbors <- seq(2, 30)
+r2s <- c()  # r-squared values (coefficient of determination)
+sum.square.error <- c()  # sum of squares
+for (k in neighbors) {
+  preds <- knn.reg(train = pca_tr.feats, y = pca_tr.targs, k = k)
+  r2s <- c(r2s, preds$R2Pred)
+  sum.square.error <- c(sum.square.error, preds$PRESS)
+}
+
+# These two plots show the affect of more neighbors.
+# We are looking for when we stopping getting more bang for our buck.
+plot(neighbors, r2s)
+plot(neighbors, sum.square.error)
+
+best.k <- 7
+pred_reg <- knn.reg(train = pca_tr.feats, test = pca_te.feats, y = pca_tr.targs, k = best.k)
+pred_reg <- round(pred_reg$pred)
+confusionMatrix(as.factor(pred_reg), as.factor(pca_te.targs))
+
+# As a classification
+te.targs <- as.factor(testPCA_songs[,11])
+pred_class<- knn(train = pca_tr.feats, test=pca_te.feats, cl=pca_tr.targs, k=best.k)
+pred_class_preds <- pred_class[1:35]
+confusionMatrix(pred_class_preds, te.targs)
+
+
+ # over sampling to handle class imbalance
+balanced_over <- ovun.sample(target ~ ., data = trainPCA_songs, method = "over", N = 160)$data
+
+# Undersampling
+balanced_under <- ovun.sample(target ~ ., data = trainPCA_songs, method = "under", N = 50, seed = 1)$data
+
+# Both
+balanced_both <- ovun.sample(target ~ ., data = trainPCA_songs, method = "both", p =.5, N= 105, seed = 1)$data
+
+# # ROSE
+balanced_ROSE <- ovun.sample(target ~ ., data = trainPCA_songs, seed = 1)$data
+
+
+# Under Sample the losing songs (Accuracy of 54%, specificity of 37.5%)
+# pca_tr.feats <- balanced_under[,-11]
+# pca_tr.targs <- balanced_under[,11]
+# 
+# pca_te.feats <- testPCA_songs[,-11]
+# pca_te.targs <- testPCA_songs[,11]
+# 
+# 
+# # find best number of k neighbors
+# neighbors <- seq(2, 30)
+# r2s <- c()  # r-squared values (coefficient of determination)
+# sum.square.error <- c()  # sum of squares
+# for (k in neighbors) {
+#   preds <- knn.reg(train = pca_tr.feats, y = pca_tr.targs, k = k)
+#   r2s <- c(r2s, preds$R2Pred)
+#   sum.square.error <- c(sum.square.error, preds$PRESS)
+# }
+# 
+# # These two plots show the affect of more neighbors.
+# # We are looking for when we stopping getting more bang for our buck.
+# plot(neighbors, r2s)
+# plot(neighbors, sum.square.error)
+# 
+# best.k <- 17
+# pred_reg <- knn.reg(train = pca_tr.feats, test = pca_te.feats, y = pca_tr.targs, k = best.k)
+# pred_reg <- round(pred_reg$pred)
+# confusionMatrix(as.factor(pred_reg), as.factor(pca_te.targs))
+# 
+# # As a classification
+# te.targs <- as.factor(testPCA_songs[,11])
+# pred_class<- knn(train = pca_tr.feats, test=pca_te.feats, cl=pca_tr.targs, k=best.k)
+# pred_class_preds <- pred_class[1:35]
+# confusionMatrix(pred_class_preds, te.targs)
+
+# Over sampling the winning songs (accuracy of 77% but a specificity of 12.5%)
+pca_tr.feats <- balanced_over[,-11]
+pca_tr.targs <- balanced_over[,11]
+
+pca_te.feats <- testPCA_songs[,-11]
+pca_te.targs <- testPCA_songs[,11]
+
+
+# find best number of k neighbors
+neighbors <- seq(2, 30)
+r2s <- c()  # r-squared values (coefficient of determination)
+sum.square.error <- c()  # sum of squares
+for (k in neighbors) {
+  preds <- knn.reg(train = pca_tr.feats, y = pca_tr.targs, k = k)
+  r2s <- c(r2s, preds$R2Pred)
+  sum.square.error <- c(sum.square.error, preds$PRESS)
+}
+
+# These two plots show the affect of more neighbors.
+# We are looking for when we stopping getting more bang for our buck.
+plot(neighbors, r2s)
+plot(neighbors, sum.square.error)
+
+best.k <- 22
+pred_reg <- knn.reg(train = pca_tr.feats, test = pca_te.feats, y = pca_tr.targs, k = best.k)
+pred_reg <- round(pred_reg$pred)
+confusionMatrix(as.factor(pred_reg), as.factor(pca_te.targs))
+
+# As a classification
+te.targs <- as.factor(testPCA_songs[,11])
+pred_class<- knn(train = pca_tr.feats, test=pca_te.feats, cl=pca_tr.targs, k=best.k)
+pred_class_preds <- pred_class[1:35]
+confusionMatrix(pred_class_preds, te.targs)
+
+
+# Both over and under sampling the  (accuracy of 71% but a specificity of 37.5%)
+pca_tr.feats <- balanced_both[,-11]
+pca_tr.targs <- balanced_both[,11]
+
+pca_te.feats <- testPCA_songs[,-11]
+pca_te.targs <- testPCA_songs[,11]
+
+
+# find best number of k neighbors
+neighbors <- seq(2, 30)
+r2s <- c()  # r-squared values (coefficient of determination)
+sum.square.error <- c()  # sum of squares
+for (k in neighbors) {
+  preds <- knn.reg(train = pca_tr.feats, y = pca_tr.targs, k = k)
+  r2s <- c(r2s, preds$R2Pred)
+  sum.square.error <- c(sum.square.error, preds$PRESS)
+}
+
+# These two plots show the affect of more neighbors.
+# We are looking for when we stopping getting more bang for our buck.
+plot(neighbors, r2s)
+plot(neighbors, sum.square.error)
+
+best.k <- 25
+pred_reg <- knn.reg(train = pca_tr.feats, test = pca_te.feats, y = pca_tr.targs, k = best.k)
+pred_reg <- round(pred_reg$pred)
+confusionMatrix(as.factor(pred_reg), as.factor(pca_te.targs))
+
+# As a classification
+te.targs <- as.factor(testPCA_songs[,11])
+pred_class<- knn(train = pca_tr.feats, test=pca_te.feats, cl=pca_tr.targs, k=best.k)
+pred_class_preds <- pred_class[1:35]
+confusionMatrix(pred_class_preds, te.targs)
+
+
+# ROSE sampling the winning songs (accuracy of 77% but a specificity of 12.5%)
+pca_tr.feats <- balanced_ROSE[,-11]
+pca_tr.targs <- balanced_ROSE[,11]
+
+pca_te.feats <- testPCA_songs[,-11]
+pca_te.targs <- testPCA_songs[,11]
+
+
+# find best number of k neighbors
+neighbors <- seq(2, 30)
+r2s <- c()  # r-squared values (coefficient of determination)
+sum.square.error <- c()  # sum of squares
+for (k in neighbors) {
+  preds <- knn.reg(train = pca_tr.feats, y = pca_tr.targs, k = k)
+  r2s <- c(r2s, preds$R2Pred)
+  sum.square.error <- c(sum.square.error, preds$PRESS)
+}
+
+# These two plots show the affect of more neighbors.
+# We are looking for when we stopping getting more bang for our buck.
+plot(neighbors, r2s)
+plot(neighbors, sum.square.error)
+
+best.k <- 25
+pred_reg <- knn.reg(train = pca_tr.feats, test = pca_te.feats, y = pca_tr.targs, k = best.k)
+pred_reg <- round(pred_reg$pred)
+confusionMatrix(as.factor(pred_reg), as.factor(pca_te.targs))
+
+# As a classification
+te.targs <- as.factor(testPCA_songs[,11])
+pred_class<- knn(train = pca_tr.feats, test=pca_te.feats, cl=pca_tr.targs, k=best.k)
+pred_class_preds <- pred_class[1:35]
+confusionMatrix(pred_class_preds, te.targs)
+```
+
+#### Scale Datasets
+```{r, cache=TRUE, echo=FALSE, warning=FALSE, message=FALSE}
+# Regular SCALE dataset (accuracy 76.47% and specificity 0%)
+Scale_tr.feats <- trainScale_songs[,-27]
+Scale_tr.targs <- trainScale_songs[,27]
+
+Scale_te.feats <- testScale_songs[,-27]
+Scale_te.targs <- testScale_songs[,27]
+
+# We loop from 2 to 30 to try to find the best number of neighbors for KNN.  Seems around 19 is best.
+
+# find best number of k neighbors
+neighbors <- seq(2, 30)
+r2s <- c()  # r-squared values (coefficient of determination)
+sum.square.error <- c()  # sum of squares
+for (k in neighbors) {
+  preds <- knn.reg(train  =  Scale_tr.feats, y  =  as.numeric(Scale_tr.targs)-1, k  =  k)
+  r2s <- c(r2s, preds$R2Pred)
+  sum.square.error <- c(sum.square.error, preds$PRESS)
+}
+
+# These two plots show the affect of more neighbors.
+# We are looking for when we stop getting more bang for our buck.
+plot(neighbors, r2s)
+plot(neighbors, sum.square.error)
+
+best.k <- 18
+pred_reg <- knn.reg(train  =  Scale_tr.feats, test  = Scale_te.feats, y  =  as.numeric(Scale_tr.targs)-1, k  =  best.k)
+pred_reg <- ifelse(pred_reg$pred > 0.3, 1, 0)
+confusionMatrix(as.factor(pred_reg), as.factor(Scale_te.targs))
+
+# As a classification
+te.targs <- as.factor(testScale_songs[,27])
+pred_class<- knn(train  =  Scale_tr.feats, test = Scale_te.feats, cl = Scale_tr.targs, k = best.k)
+pred_class_preds <- pred_class[1:34]
+confusionMatrix(pred_class_preds, te.targs)
+
+
+# over sampling to handle class imbalance
+balanced_over <- ovun.sample(target ~ ., data  =  trainScale_songs, method  =  "over", N  =  160)$data
+
+# Undersampling
+balanced_under <- ovun.sample(target ~ ., data  =  trainScale_songs, method  =  "under", N  =  50, seed  =  1)$data
+
+# Both
+balanced_both <- ovun.sample(target ~ ., data  =  trainScale_songs, method  =  "both", p  = .5, N =  105, seed  =  1)$data
+
+# # ROSE
+balanced_ROSE <- ovun.sample(target ~ ., data  =  trainScale_songs, seed  =  1)$data
+
+
+# Under Sample the losing songs (Accuracy of 52%, specificity of 25%)
+Scale_tr.feats <- balanced_under[,-27]
+Scale_tr.targs <- balanced_under[,27]
+
+Scale_te.feats <- testScale_songs[,-27]
+Scale_te.targs <- testScale_songs[,27]
+
+
+# find best number of k neighbors
+neighbors <- seq(2, 30)
+r2s <- c()  # r-squared values (coefficient of determination)
+sum.square.error <- c()  # sum of squares
+for (k in neighbors) {
+  preds <- knn.reg(train  =  Scale_tr.feats, y  =  as.numeric(Scale_tr.targs) -1, k  =  k)
+  r2s <- c(r2s, preds$R2Pred)
+  sum.square.error <- c(sum.square.error, preds$PRESS)
+}
+
+# These two plots show the affect of more neighbors.
+# We are looking for when we stop getting more bang for our buck.
+plot(neighbors, r2s)
+plot(neighbors, sum.square.error)
+
+best.k <- 9
+pred_reg <- knn.reg(train  =  Scale_tr.feats, test  =  Scale_te.feats, y  =  as.numeric(Scale_tr.targs) - 1, k  =  best.k)
+pred_reg <- round(pred_reg$pred)
+confusionMatrix(as.factor(pred_reg), as.factor(Scale_te.targs))
+
+# As a classification
+te.targs <- as.factor(testScale_songs[,27])
+pred_class<- knn(train  =  Scale_tr.feats, test = Scale_te.feats, cl = Scale_tr.targs, k = best.k)
+pred_class_preds <- pred_class[1:34]
+confusionMatrix(pred_class_preds, te.targs)
+
+# Over sampling the winning songs (accuracy of 53% but a specificity of 50%)
+Scale_tr.feats <- balanced_over[,-27]
+Scale_tr.targs <- balanced_over[,27]
+
+Scale_te.feats <- testScale_songs[,-27]
+Scale_te.targs <- testScale_songs[,27]
+
+
+# find best number of k neighbors
+neighbors <- seq(2, 30)
+r2s <- c()  # r-squared values (coefficient of determination)
+sum.square.error <- c()  # sum of squares
+for (k in neighbors) {
+  preds <- knn.reg(train  =  Scale_tr.feats, y  =  as.numeric(Scale_tr.targs) - 1, k  =  k)
+  r2s <- c(r2s, preds$R2Pred)
+  sum.square.error <- c(sum.square.error, preds$PRESS)
+}
+
+# These two plots show the affect of more neighbors.
+# We are looking for when we stop getting more bang for our buck.
+plot(neighbors, r2s)
+plot(neighbors, sum.square.error)
+
+best.k <- 22
+pred_reg <- knn.reg(train  =  Scale_tr.feats, test  =  Scale_te.feats, y  =  as.numeric(Scale_tr.targs) - 1, k  =  best.k)
+
+pred_reg <- round(pred_reg$pred)
+confusionMatrix(as.factor(pred_reg), as.factor(Scale_te.targs))
+
+# As a classification
+te.targs <- as.factor(testScale_songs[,27])
+pred_class<- knn(train  =  Scale_tr.feats, test = Scale_te.feats, cl = Scale_tr.targs, k = best.k)
+pred_class_preds <- pred_class[1:34]
+confusionMatrix(pred_class_preds, te.targs)
+
+
+# Both over and under sampling the  (accuracy of 29% but a specificity of 50%)
+Scale_tr.feats <- balanced_both[,-27]
+Scale_tr.targs <- balanced_both[,27]
+
+Scale_te.feats <- testScale_songs[,-27]
+Scale_te.targs <- testScale_songs[,27]
+
+
+# find best number of k neighbors
+neighbors <- seq(2, 30)
+r2s <- c()  # r-squared values (coefficient of determination)
+sum.square.error <- c()  # sum of squares
+for (k in neighbors) {
+  preds <- knn.reg(train  =  Scale_tr.feats, y  =  as.numeric(Scale_tr.targs) - 1, k  =  k)
+  r2s <- c(r2s, preds$R2Pred)
+  sum.square.error <- c(sum.square.error, preds$PRESS)
+}
+
+# These two plots show the affect of more neighbors.
+# We are looking for when we stop getting more bang for our buck.
+plot(neighbors, r2s)
+plot(neighbors, sum.square.error)
+
+best.k <- 9
+pred_reg <- knn.reg(train  =  Scale_tr.feats, test  =  Scale_te.feats, y  =  as.numeric(Scale_tr.targs) - 1, k  =  best.k)
+pred_reg <- round(pred_reg$pred)
+confusionMatrix(as.factor(pred_reg), as.factor(Scale_te.targs))
+
+# As a classification
+te.targs <- as.factor(testScale_songs[,27])
+pred_class<- knn(train  =  Scale_tr.feats, test = Scale_te.feats, cl = Scale_tr.targs, k = best.k)
+pred_class_preds <- pred_class[1:34]
+confusionMatrix(pred_class_preds, te.targs)
+
+
+# ROSE sampling the winning songs (accuracy of 71% but a specificity of 50%)
+Scale_tr.feats <- balanced_ROSE[,-27]
+Scale_tr.targs <- balanced_ROSE[,27]
+
+Scale_te.feats <- testScale_songs[,-27]
+Scale_te.targs <- testScale_songs[,27]
+
+
+# find best number of k neighbors
+neighbors <- seq(2, 30)
+r2s <- c()  # r-squared values (coefficient of determination)
+sum.square.error <- c()  # sum of squares
+for (k in neighbors) {
+  preds <- knn.reg(train  =  Scale_tr.feats, y  =  as.numeric(Scale_tr.targs) - 1, k  =  k)
+  r2s <- c(r2s, preds$R2Pred)
+  sum.square.error <- c(sum.square.error, preds$PRESS)
+}
+
+# These two plots show the affect of more neighbors.
+# We are looking for when we stop getting more bang for our buck.
+plot(neighbors, r2s)
+plot(neighbors, sum.square.error)
+
+best.k <- 9
+pred_reg <- knn.reg(train  =  Scale_tr.feats, test  =  Scale_te.feats, y  =  as.numeric(Scale_tr.targs) - 1, k  =  best.k)
+pred_reg <- round(pred_reg$pred)
+confusionMatrix(as.factor(pred_reg), as.factor(Scale_te.targs))
+
+# As a classification
+te.targs <- as.factor(testScale_songs[,27])
+pred_class<- knn(train  =  Scale_tr.feats, test = Scale_te.feats, cl = Scale_tr.targs, k = best.k)
+pred_class_preds <- as.numeric(pred_class[1:34])-1
+pred_class_preds <- ifelse(pred_class_preds >= 1, 0, 1)
+confusionMatrix(as.factor(pred_class_preds), te.targs)
+
+
+
+```
+
